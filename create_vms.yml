@@ -1,0 +1,86 @@
+- name: Create VM copies from snapshot
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    base_vm: debian13-uni
+    snapshot: ""  # Will be auto-detected if empty
+    copies: 3
+    image_dir: "/home/manuel/.local/share/gnome-boxes/images"
+
+  tasks:
+    - name: Check virt-clone is available
+      ansible.builtin.command: which virt-clone
+      register: virt_clone_check
+      changed_when: false
+
+    - name: Fail if virt-clone missing
+      ansible.builtin.fail:
+        msg: "virt-clone not found. Install with: sudo dnf install virt-manager"
+      when: virt_clone_check.rc != 0
+
+    - name: Get actual domain name (handles Boxes naming)
+      ansible.builtin.command: virsh list --all --name
+      register: domains
+      changed_when: false
+
+    - name: Set correct domain name
+      ansible.builtin.set_fact:
+        actual_vm: "{{ base_vm }}"
+      when: base_vm in domains.stdout_lines
+
+    - name: Fail if VM not found
+      ansible.builtin.fail:
+        msg: "VM '{{ base_vm }}' not found. Available VMs: {{ domains.stdout_lines | join(', ') }}"
+      when: base_vm not in domains.stdout_lines
+
+    - name: Get snapshot list
+      ansible.builtin.command: virsh snapshot-list {{ actual_vm }} --name
+      register: snapshots
+      changed_when: false
+
+    - name: Use first snapshot if none specified
+      ansible.builtin.set_fact:
+        snapshot: "{{ snapshots.stdout_lines[0] }}"
+      when: snapshot == "" and snapshots.stdout_lines | length > 0
+
+    - name: Fail if no snapshots
+      ansible.builtin.fail:
+        msg: "No snapshots found for {{ actual_vm }}. Create one in Boxes first."
+      when: snapshots.stdout_lines | length == 0
+
+    - name: Ensure VM is shut off before cloning
+      ansible.builtin.command: virsh shutdown {{ actual_vm }}
+      when: "'running' in (domains.stdout | lower)"
+      register: shutdown_result
+      ignore_errors: true
+      changed_when: shutdown_result.rc == 0
+
+    - name: Wait for VM to shut down
+      ansible.builtin.command: virsh list --all --name
+      register: domains_after
+      until: actual_vm not in (domains_after.stdout | lower | regex_replace('.*state.*running.*', ''))
+      retries: 10
+      delay: 5
+      when: "'running' in (domains.stdout | lower)"
+      changed_when: false
+
+    - name: Revert VM to snapshot before cloning
+      ansible.builtin.command: virsh -c qemu:///session snapshot-revert {{ actual_vm }} {{ snapshot }}
+      register: revert_result
+      changed_when: revert_result.rc == 0
+      when: snapshot != ""
+
+    - name: Clone VM copies
+      ansible.builtin.command: >
+        virt-clone
+        --connect qemu:///session
+        --original {{ actual_vm }}
+        --name {{ actual_vm }}-copy{{ item }}
+        --auto-clone
+        --file {{ image_dir }}/{{ actual_vm }}-copy{{ item }}.qcow2
+      loop: "{{ range(1, copies | int + 1) | list }}"
+      register: clone_result
+      changed_when: "'already exists' not in clone_result.stderr"
+      ignore_errors: true
